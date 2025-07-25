@@ -1,4 +1,4 @@
-debug_mode: false
+debug_mode: true
 seed: 0
 input_dir: input
 input_path: ''
@@ -13,13 +13,14 @@ num_workers: 28
 
 train:
   num_epochs: 100000
-  batch_size: 512
+  batch_size: 200
   learning_rate: 0.001
-  weight_decay: 1
+  weight_decay: 0.01
   loss: ce
   label_smoothing: 0
   subset_size: 1000
   grad_norm: 1.0
+  initialization_scale: 10
 
 val:
   batch_size: 512

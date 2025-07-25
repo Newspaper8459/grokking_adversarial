@@ -16,6 +16,7 @@ class TrainConfig:  # noqa: D101
   label_smoothing: float
   subset_size: int
   grad_norm: float
+  initialization_scale: float
 
 class ValConfig:  # noqa: D101
   batch_size: int

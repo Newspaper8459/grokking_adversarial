@@ -9,8 +9,8 @@ class MLP(nn.Module):
       nn.Flatten(),
       nn.Linear(784, hidden_dim),
       nn.ReLU(),
-      *[nn.Linear(hidden_dim, hidden_dim) if i%2 == 0 else nn.ReLU() for i in range(hidden_layers)],
-      nn.Linear(hidden_dim, 1)
+      *[nn.Linear(hidden_dim, hidden_dim) if i%2 == 0 else nn.ReLU() for i in range(2*hidden_layers)],
+      nn.Linear(hidden_dim, 10)
     )
 
   def forward(self, x: torch.Tensor):

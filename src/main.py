@@ -12,6 +12,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 import wandb
@@ -69,15 +70,17 @@ def train_one_epoch(
   total_correct = 0
   total_samples = 0
 
+  one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
+
   for images, labels in dataloader:
     optimizer.zero_grad()
 
     images = images.to(config.device)
-    labels = labels.to(config.device).half()
-
+    labels = labels.to(config.device)
     with torch.autocast(config.device, dtype=torch.float16):
-      y_prob = model(images).squeeze(1)
-      loss = criterion(labels, y_prob)
+      y_logit = model(images).squeeze(1)
+      # loss = criterion(labels, y_prob)
+      loss = criterion(one_hots[labels], y_logit)
     total_loss += loss.item()
 
     # loss.backward()
@@ -88,7 +91,8 @@ def train_one_epoch(
     scaler.step(optimizer)
     scaler.update()
 
-    y_pred = torch.round(y_prob)
+    y_prob = F.softmax(y_logit, dim=1)
+    y_pred = y_prob.argmax(dim=1)
     correct = (y_pred == labels).sum().item()
     total_correct += correct
     total_samples += labels.size(0)
@@ -110,16 +114,18 @@ def validate(
   total_correct = 0
   total_samples = 0
 
+  one_hots = torch.eye(10, 10, dtype=torch.float, device=config.device)
   for images, labels in dataloader:
     images = images.to(config.device)
-    labels = labels.to(config.device).float()
+    labels = labels.to(config.device)
 
     with torch.no_grad():
-      y_prob = model(images).squeeze(1)
-    loss = criterion(labels, y_prob)
+      y_logit = model(images).squeeze(1)
+    loss = criterion(one_hots[labels], y_logit)
     total_loss += loss.item()
 
-    y_pred = torch.round(y_prob)
+    y_prob = F.softmax(y_logit, dim=1)
+    y_pred = y_prob.argmax(dim=1)
     correct = (y_pred == labels).sum().item()
     total_correct += correct
     total_samples += labels.size(0)
@@ -131,19 +137,20 @@ def validate(
 
 def run(config: Config):
   transforms = T.Compose([
-    T.ToTensor(),
+    # T.ToTensor(),
+    T.RandomRotation((-30, 30), T.InterpolationMode.NEAREST)
   ])
 
   train_dataset = CustomMNIST(
     config.input_path,
-    # transform=transforms,
+    transform=transforms,
     download=True
   )
   train_dataset = Subset(train_dataset, range(config.train.subset_size))
   val_dataset = CustomMNIST(
     config.input_path,
     train=False,
-    # transform=transforms,
+    transform=transforms,
     download=True
   )
 
@@ -167,10 +174,16 @@ def run(config: Config):
   )
 
   model = MLP(config.mlp.hidden_dim, config.mlp.hidden_layers).to(config.device)
+  model = cast(MLP, torch.compile(model, mode='default'))
+
+  with torch.no_grad():
+    for p in model.parameters():
+      p.data *= config.train.initialization_scale
+
   optimizer = AdamW(
     model.parameters(),
     lr=config.train.learning_rate,
-    betas=(0.9, 0.98),
+    # betas=(0.9, 0.98),
     weight_decay=config.train.weight_decay,
   )
 
