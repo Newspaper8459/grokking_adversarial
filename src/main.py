@@ -77,19 +77,19 @@ def train_one_epoch(
 
     images = images.to(config.device)
     labels = labels.to(config.device)
-    with torch.autocast(config.device, dtype=torch.float16):
-      y_logit = model(images).squeeze(1)
-      # loss = criterion(labels, y_prob)
-      loss = criterion(one_hots[labels], y_logit)
+    # with torch.autocast(config.device, dtype=torch.float16):
+    y_logit = model(images).squeeze(1)
+    loss = criterion(one_hots[labels], y_logit)
     total_loss += loss.item()
 
-    # loss.backward()
-    scaler.scale(loss).backward()
-    # optimizer.step()
-    scaler.unscale_(optimizer)
-    nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
-    scaler.step(optimizer)
-    scaler.update()
+    loss.backward()
+    optimizer.step()
+
+    # scaler.scale(loss).backward()
+    # scaler.unscale_(optimizer)
+    # nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
+    # scaler.step(optimizer)
+    # scaler.update()
 
     y_prob = F.softmax(y_logit, dim=1)
     y_pred = y_prob.argmax(dim=1)
@@ -114,7 +114,7 @@ def validate(
   total_correct = 0
   total_samples = 0
 
-  one_hots = torch.eye(10, 10, dtype=torch.float, device=config.device)
+  one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
   for images, labels in dataloader:
     images = images.to(config.device)
     labels = labels.to(config.device)
@@ -143,14 +143,14 @@ def run(config: Config):
 
   train_dataset = CustomMNIST(
     config.input_path,
-    transform=transforms,
+    # transform=transforms,
     download=True
   )
   train_dataset = Subset(train_dataset, range(config.train.subset_size))
   val_dataset = CustomMNIST(
     config.input_path,
     train=False,
-    transform=transforms,
+    # transform=transforms,
     download=True
   )
 
@@ -228,6 +228,9 @@ def run(config: Config):
 
 
 def main():
+  ###################################################
+  # TODO: float64統一
+  ###################################################
   with hydra.initialize_config_dir(config_dir=str(CONFIG_PATH), version_base='1.1'):
     cfg = cast(Config, hydra.compose(config_name=args.config))
 
@@ -261,7 +264,8 @@ def main():
     logger = logging.getLogger(name)
     logger.addHandler(file_handler)
 
-  torch.set_float32_matmul_precision('high')
+  # torch.set_float32_matmul_precision('high')
+  # torch.set_default_dtype(torch.float32)
   run(cfg)
 
 if __name__ == '__main__':

@@ -1,10 +1,11 @@
-debug_mode: true
+debug_mode: false
 seed: 0
 input_dir: input
 input_path: ''
 output_dir: output
 output_path: ''
 device: ''
+# dtype: float64
 
 wandb:
   project: grokking_mnist
@@ -12,7 +13,7 @@ wandb:
 num_workers: 28
 
 train:
-  num_epochs: 100000
+  num_epochs: 20000
   batch_size: 200
   learning_rate: 0.001
   weight_decay: 0.01
@@ -20,7 +21,7 @@ train:
   label_smoothing: 0
   subset_size: 1000
   grad_norm: 1.0
-  initialization_scale: 10
+  initialization_scale: 6
 
 val:
   batch_size: 512

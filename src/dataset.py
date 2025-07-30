@@ -16,6 +16,7 @@ class CustomMNIST(MNIST):
     download: bool = False
   ) -> None:
     super().__init__(root, train, transform, target_transform, download)
+    self.data = self.data.float() / 255.0
     self.data = self.data.unsqueeze(1)
     if self.transform is not None:
       self.data = self.transform(self.data)
