@@ -17,14 +17,20 @@ import torchvision
 import torchvision.transforms as T
 import wandb
 import yaml
+from ffcv.loader import Loader
 from omegaconf import OmegaConf
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Subset
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import CustomMNIST
-from models.mlp import MLP
+from attacks import PGD
+from dataset import get_dataloader
 from schema.config import Config
+from utils.constants import (
+  get_loss_func,
+  get_model,
+  get_optimizer,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / 'configs'
@@ -43,7 +49,7 @@ def seed_everything(seed: int=0):
   torch.manual_seed(seed)
   torch.cuda.manual_seed_all(seed)
   torch.backends.cudnn.deterministic = True
-  torch.backends.cudnn.benchmark = False
+  torch.backends.cudnn.benchmark = True
   os.environ['PYTHONHASHSEED'] = str(seed)
 
 def seed_worker(worker_id: int):
@@ -54,86 +60,141 @@ def seed_worker(worker_id: int):
   # dataset = worker_info.dataset
   # dataset._init_file()
 
-g = torch.Generator()
-g.manual_seed(0)
-
 def train_one_epoch(
   config: Config,
   model: nn.Module,
-  optimizer: torch.optim.Optimizer,
+  optimizer: Optimizer,
   criterion: nn.Module,
-  dataloader: Any,
-):
+  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
+) -> tuple[float, float]:
   model.train()
 
-  total_loss = 0.0
-  total_correct = 0
+  total_loss = torch.tensor(0.0, device=config.device)
+  total_correct = torch.tensor(0, device=config.device)
   total_samples = 0
 
-  one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
+  # one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
 
   for images, labels in dataloader:
     optimizer.zero_grad()
+    images = cast(torch.Tensor, images)
+    labels = cast(torch.Tensor, labels)
 
-    images = images.to(config.device)
-    labels = labels.to(config.device)
-    # with torch.autocast(config.device, dtype=torch.float16):
-    y_logit = model(images).squeeze(1)
-    loss = criterion(one_hots[labels], y_logit)
-    total_loss += loss.item()
+    images = images.to(config.device, non_blocking=True)
+    labels = labels.to(config.device, non_blocking=True)
 
-    loss.backward()
-    optimizer.step()
+    with torch.autocast(
+      config.device,
+      dtype=torch.bfloat16,
+      enabled=config.use_amp
+    ):
+      y_logit = model(images)
+      loss = criterion(y_logit, labels)
+    total_loss += loss
 
-    # scaler.scale(loss).backward()
-    # scaler.unscale_(optimizer)
-    # nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
-    # scaler.step(optimizer)
-    # scaler.update()
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
+    scaler.step(optimizer)
+    scaler.update()
 
     y_prob = F.softmax(y_logit, dim=1)
     y_pred = y_prob.argmax(dim=1)
-    correct = (y_pred == labels).sum().item()
+    correct = (y_pred == labels).sum()
     total_correct += correct
-    total_samples += labels.size(0)
+    total_samples += labels.shape[0]
 
   avg_loss = total_loss / len(dataloader)
-  avg_acc = total_correct / total_samples if total_samples > 0 else 0.0
+  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
 
-  return avg_loss, avg_acc
+  return avg_loss.item(), avg_acc.item()
 
-def validate(
+def test(
   config: Config,
   model: nn.Module,
   criterion: nn.Module,
-  dataloader: Any,
-):
+  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
+) -> tuple[float, float]:
   model.eval()
 
-  total_loss = 0.0
-  total_correct = 0
+  total_loss = torch.tensor(0.0, device=config.device)
+  total_correct = torch.tensor(0, device=config.device)
   total_samples = 0
 
-  one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
   for images, labels in dataloader:
-    images = images.to(config.device)
-    labels = labels.to(config.device)
+    images = cast(torch.Tensor, images)
+    labels = cast(torch.Tensor, labels)
+
+    images = images.to(config.device, non_blocking=True)
+    labels = labels.to(config.device, non_blocking=True)
 
     with torch.no_grad():
-      y_logit = model(images).squeeze(1)
-    loss = criterion(one_hots[labels], y_logit)
-    total_loss += loss.item()
+      with torch.autocast(
+        config.device,
+        dtype=torch.bfloat16,
+        enabled=config.use_amp
+      ):
+        y_logit = model(images).squeeze(1)
+        loss = criterion(y_logit, labels)
+    total_loss += loss
 
     y_prob = F.softmax(y_logit, dim=1)
     y_pred = y_prob.argmax(dim=1)
-    correct = (y_pred == labels).sum().item()
+    correct = (y_pred == labels).sum()
     total_correct += correct
-    total_samples += labels.size(0)
+    total_samples += labels.shape[0]
 
   avg_loss = total_loss / len(dataloader)
-  avg_acc = total_correct / total_samples if total_samples > 0 else 0.0
+  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
 
-  return avg_loss, avg_acc
+  return avg_loss.item(), avg_acc.item()
+
+def validate_adversarial(
+  config: Config,
+  model: nn.Module,
+  criterion: nn.Module,
+  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
+) -> tuple[float, float]:
+  model.eval()
+
+  atk = PGD(
+    model,
+    config,
+  )
+
+  total_loss = torch.tensor(0.0, device=config.device)
+  total_correct = torch.tensor(0, device=config.device)
+  total_samples = 0
+
+  for images, labels in dataloader:
+    images = cast(torch.Tensor, images)
+    labels = cast(torch.Tensor, labels)
+
+    images = images.to(config.device, non_blocking=True)
+    labels = labels.to(config.device, non_blocking=True)
+
+    adv_images = atk(images, labels)
+
+    with torch.no_grad():
+      with torch.autocast(
+        config.device,
+        dtype=torch.bfloat16,
+        enabled=config.use_amp,
+      ):
+        y_logit = model(adv_images)
+      loss = criterion(y_logit, labels)
+    total_loss += loss
+
+    y_prob = F.softmax(y_logit, dim=1)
+    y_pred = y_prob.argmax(dim=1)
+    correct = (y_pred == labels).sum()
+    total_correct += correct
+    total_samples += labels.shape[0]
+
+  avg_loss = total_loss / len(dataloader)
+  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
+
+  return avg_loss.item(), avg_acc.item()
 
 def run(config: Config):
   transforms = T.Compose([
@@ -141,98 +202,117 @@ def run(config: Config):
     T.RandomRotation((-30, 30), T.InterpolationMode.NEAREST)
   ])
 
-  train_dataset = CustomMNIST(
-    config.input_path,
-    # transform=transforms,
-    download=True
-  )
-  train_dataset = Subset(train_dataset, range(config.train.subset_size))
-  val_dataset = CustomMNIST(
-    config.input_path,
-    train=False,
-    # transform=transforms,
-    download=True
-  )
+  train_dataloader = get_dataloader(config)
+  val_dataloader = get_dataloader(config, train=False)
 
-  train_dataloader = DataLoader(
-    train_dataset,
-    batch_size=config.train.batch_size,
-    shuffle=True,
-    num_workers=config.num_workers,
-    generator=g,
-    pin_memory=True if config.num_workers else False,
-    persistent_workers=True
+  model = get_model(config.model, config).to(
+    device=config.device,
+    non_blocking=True,
+    memory_format=torch.channels_last
   )
-  val_dataloader = DataLoader(
-    val_dataset,
-    batch_size=config.val.batch_size,
-    shuffle=False,
-    num_workers=config.num_workers,
-    generator=g,
-    pin_memory=True if config.num_workers else False,
-    persistent_workers=True
-  )
+  model = cast(nn.Module, model)
+  # model = cast(nn.Module, torch.compile(model, mode='reduce-overhead'))
 
-  model = MLP(config.mlp.hidden_dim, config.mlp.hidden_layers).to(config.device)
-  model = cast(MLP, torch.compile(model, mode='default'))
-
-  with torch.no_grad():
-    for p in model.parameters():
-      p.data *= config.train.initialization_scale
-
-  optimizer = AdamW(
+  optimizer = get_optimizer(config.train.optimizer)(
     model.parameters(),
     lr=config.train.learning_rate,
-    # betas=(0.9, 0.98),
     weight_decay=config.train.weight_decay,
   )
 
-  loss_fn = nn.MSELoss()
+  loss_fn = get_loss_func(config).to(config.device, non_blocking=True)
 
-  logger = logging.getLogger('__main__')
+  # tqdm_ = tqdm(range(config.train.num_epochs), )
+  # for epoch in tqdm_:
+  steps = 0
+  log_steps = set(config.log_steps)
+  with tqdm(total=len(log_steps)) as pbar:
+    while steps < config.train.optimization_steps:
+      data: dict[str, float] = {}
+      data_str: dict[str, str] = {}
+      data_str['steps'] = 0
 
-  tqdm_ = tqdm(range(config.train.num_epochs))
-  for epoch in tqdm_:
-    train_loss, train_acc = train_one_epoch(
-      config,
-      model,
-      optimizer,
-      loss_fn,
-      train_dataloader,
-    )
+      for images, labels in train_dataloader:
+        if steps >= config.train.optimization_steps:
+          break
 
-    val_loss, val_acc = validate(
-      config,
-      model,
-      loss_fn,
-      val_dataloader
-    )
+        images = cast(torch.Tensor, images)
+        labels = cast(torch.Tensor, labels)
 
-    tqdm.set_postfix(
-      tqdm_,
-      {
-        "train loss": f'{train_loss:.4f}',
-        "train acc": f'{train_acc:.4f}',
-        "val loss": f'{val_loss:.4f}',
-        "val acc": f'{val_acc:.4f}'
-      }
-    )
+        images = images.to(config.device, non_blocking=True)
+        labels = labels.to(config.device, non_blocking=True)
 
-    wandb.log({
-      'train_loss_curve': train_loss,
-      'train_acc': train_acc,
-      'val_loss_curve': val_loss,
-      'val_acc': val_acc,
-    }, step=epoch)
+        with torch.autocast(
+          config.device,
+          dtype=torch.bfloat16,
+          enabled=config.use_amp,
+        ):
+          y_logit = model(images)
+          loss = loss_fn(y_logit, labels)
 
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
 
+        if steps in log_steps:
+          train_loss, train_acc = test(
+            config,
+            model,
+            loss_fn,
+            train_dataloader,
+          )
+          data['train_loss_curve'] = train_loss
+          data['train_acc'] = train_acc
+
+          val_loss, val_acc = test(
+            config,
+            model,
+            loss_fn,
+            val_dataloader
+          )
+          data['val_loss_curve'] = val_loss
+          data['val_acc'] = val_acc
+
+          if config.adversarial.compute_robust:
+            adv_loss, adv_acc = validate_adversarial(
+              config,
+              model,
+              loss_fn,
+              val_dataloader
+            )
+            data['adv_loss_curve'] = adv_loss
+            data['adv_acc'] = adv_acc
+
+          with torch.no_grad():
+            norm = torch.sqrt(
+              sum((p.data.float()**2).sum() for p in model.parameters())
+            ).item()
+            data['norm'] = norm
+
+          data['steps'] = steps
+
+          for k, v in data.items():
+            if k == 'steps':
+              data_str[k] = str(v)
+            else:
+              data_str[k] = f'{v:.4f}'
+
+          wandb.log(data, step=steps)
+          pbar.update(1)
+
+        data_str['steps'] = str(steps)
+        tqdm.set_postfix(pbar, data_str)
+        steps += 1
 
 def main():
-  ###################################################
-  # TODO: float64統一
-  ###################################################
   with hydra.initialize_config_dir(config_dir=str(CONFIG_PATH), version_base='1.1'):
-    cfg = cast(Config, hydra.compose(config_name=args.config))
+    yaml_cfg = hydra.compose(config_name=args.config)
+
+    default_cfg = OmegaConf.structured(Config)
+
+    cfg = cast(Config, OmegaConf.merge(default_cfg, yaml_cfg))
+    # cfg = cast(Config, hydra.compose(config_name=args.config))
 
   cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
   seed_everything(cfg.seed)
@@ -252,6 +332,14 @@ def main():
   cfg.input_path = ROOT / cfg.input_dir
   cfg.output_path = ROOT / cfg.output_dir / wandb.run.dir
 
+  if not cfg.log_steps:
+    # cfg.log_steps = list(range(100)) + list(range(100, cfg.train.optimization_steps, 10))
+    cfg.log_steps = np.unique(np.clip(
+      np.logspace(0, np.log10(cfg.train.optimization_steps), 2000).astype(int),
+      0,
+      cfg.train.optimization_steps,
+    )).tolist()
+
   with open(CONFIG_PATH / 'log_config.yaml') as f:
     log_config = yaml.safe_load(f)
 
@@ -264,7 +352,7 @@ def main():
     logger = logging.getLogger(name)
     logger.addHandler(file_handler)
 
-  # torch.set_float32_matmul_precision('high')
+  torch.set_float32_matmul_precision('high')
   # torch.set_default_dtype(torch.float32)
   run(cfg)
 

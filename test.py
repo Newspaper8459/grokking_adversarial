@@ -1,26 +1,19 @@
+from itertools import islice
 from pathlib import Path
+from time import time
 
+import numpy as np
 import torch
 import torchvision
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset
+from torchvision.datasets import MNIST, CIFAR10, ImageNet
+from torchvision.models.resnet import resnet18
+from tqdm import tqdm
+
 
 ROOT = Path(__file__).resolve().parent
 
-transforms = T.Compose([
-  T.ToTensor(),
-])
+a = np.unique(np.clip(np.logspace(0, np.log10(500000), 1000), 0, 500000).astype(int))
 
-train_dataset = torchvision.datasets.MNIST(
-  ROOT / 'input',
-  transform=transforms,
-  download=True
-)
-train_dataset = Subset(train_dataset, range(1000))
-val_dataset = torchvision.datasets.MNIST(
-  ROOT / 'input',
-  train=False,
-  transform=transforms,
-  download=True
-)
-
+print(a)
