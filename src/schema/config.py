@@ -1,9 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Literal
-
-from omegaconf import DictConfig
 
 
 @dataclass
@@ -41,13 +38,17 @@ class LocalComplexityConfig:  # noqa: D101
 @dataclass
 class AdversarialConfig:  # noqa: D101
   compute_robust: bool
-  atk_eps_numerator: int
-  atk_alpha_numerator: int
   atk_epochs: int
   dmax: float
   dmin: float
-  atk_eps: float = .0
-  atk_alpha: float = .0
+  atk_eps: float
+  atk_alpha: float
+
+@dataclass
+class EarlyStoppingConfig:  # noqa: D101
+  enable: bool
+  patience: int
+  verbose: int
 
 @dataclass
 class DatasetConfig:  # noqa: D101
@@ -75,12 +76,13 @@ class Config:  # noqa: D101
   seed: int
   input_dir: str
   output_dir: str
-  use_amp: bool
+  save_model: bool
   wandb: WandbConfig
   train: TrainConfig
   val: ValConfig
   local_complexity: LocalComplexityConfig
   adversarial: AdversarialConfig
+  early_stopping: EarlyStoppingConfig
   dataset: DatasetConfig
   mnist: MNISTConfig
   model: str

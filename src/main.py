@@ -3,6 +3,7 @@ import logging
 import logging.config
 import os
 import random
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,7 +14,6 @@ import numpy.typing as npt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 import torchvision.transforms as T
 import wandb
 import yaml
@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from attacks import PGD
 from dataset import get_dataloader
+from models.preact_resnet import resnet18
 from schema.config import Config
 from utils.constants import (
   get_loss_func,
@@ -40,7 +41,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--config', '-c', help='config file', default='main.yaml')
 args = parser.parse_args()
 
-scaler = torch.GradScaler()
+def fraction_resolver(s: str) -> float:
+  f = Fraction(s)
+  return float(f)
+
+OmegaConf.register_new_resolver('fraction', fraction_resolver)
+
 
 def seed_everything(seed: int=0):
   """Fix all random seeds"""
@@ -60,54 +66,26 @@ def seed_worker(worker_id: int):
   # dataset = worker_info.dataset
   # dataset._init_file()
 
-def train_one_epoch(
-  config: Config,
-  model: nn.Module,
-  optimizer: Optimizer,
-  criterion: nn.Module,
-  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
-) -> tuple[float, float]:
-  model.train()
+class EarlyStopping:
+  def __init__(self, patience: int=10, verbose: int=0):
+    self.cnt = 0
+    self.best_loss = float('inf')
+    self.patience = patience
+    self.verbose = verbose
 
-  total_loss = torch.tensor(0.0, device=config.device)
-  total_correct = torch.tensor(0, device=config.device)
-  total_samples = 0
+  def __call__(self, loss: float) -> Any:
+    if self.best_loss < loss:
+      self.cnt += 1
 
-  # one_hots = torch.eye(10, 10, dtype=torch.float32, device=config.device)
+      if self.cnt >= self.patience:
+        if self.verbose:
+          print('early stopping')
+        return True
+    else:
+      self.cnt = 0
+      self.best_loss = loss
 
-  for images, labels in dataloader:
-    optimizer.zero_grad()
-    images = cast(torch.Tensor, images)
-    labels = cast(torch.Tensor, labels)
-
-    images = images.to(config.device, non_blocking=True)
-    labels = labels.to(config.device, non_blocking=True)
-
-    with torch.autocast(
-      config.device,
-      dtype=torch.bfloat16,
-      enabled=config.use_amp
-    ):
-      y_logit = model(images)
-      loss = criterion(y_logit, labels)
-    total_loss += loss
-
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
-    scaler.step(optimizer)
-    scaler.update()
-
-    y_prob = F.softmax(y_logit, dim=1)
-    y_pred = y_prob.argmax(dim=1)
-    correct = (y_pred == labels).sum()
-    total_correct += correct
-    total_samples += labels.shape[0]
-
-  avg_loss = total_loss / len(dataloader)
-  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
-
-  return avg_loss.item(), avg_acc.item()
+    return False
 
 def test(
   config: Config,
@@ -125,17 +103,12 @@ def test(
     images = cast(torch.Tensor, images)
     labels = cast(torch.Tensor, labels)
 
-    images = images.to(config.device, non_blocking=True)
-    labels = labels.to(config.device, non_blocking=True)
+    images = images.cuda()
+    labels = labels.cuda()
 
     with torch.no_grad():
-      with torch.autocast(
-        config.device,
-        dtype=torch.bfloat16,
-        enabled=config.use_amp
-      ):
-        y_logit = model(images).squeeze(1)
-        loss = criterion(y_logit, labels)
+      y_logit = model(images)
+      loss = criterion(y_logit, labels)
     total_loss += loss
 
     y_prob = F.softmax(y_logit, dim=1)
@@ -156,7 +129,10 @@ def validate_adversarial(
   dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
 ) -> tuple[float, float]:
   model.eval()
-
+  atk = PGD(
+    model,
+    config=config,
+  )
   atk = PGD(
     model,
     config,
@@ -170,18 +146,13 @@ def validate_adversarial(
     images = cast(torch.Tensor, images)
     labels = cast(torch.Tensor, labels)
 
-    images = images.to(config.device, non_blocking=True)
-    labels = labels.to(config.device, non_blocking=True)
+    images = images.cuda()
+    labels = labels.cuda()
 
     adv_images = atk(images, labels)
 
     with torch.no_grad():
-      with torch.autocast(
-        config.device,
-        dtype=torch.bfloat16,
-        enabled=config.use_amp,
-      ):
-        y_logit = model(adv_images)
+      y_logit = model(adv_images)
       loss = criterion(y_logit, labels)
     total_loss += loss
 
@@ -198,12 +169,13 @@ def validate_adversarial(
 
 def run(config: Config):
   transforms = T.Compose([
-    # T.ToTensor(),
-    T.RandomRotation((-30, 30), T.InterpolationMode.NEAREST)
+    T.ToTensor(),
+    T.ConvertImageDtype(torch.float32),
+    T.Normalize((0.4914, 0.4822, 0.4465),(0.2023, 0.1994, 0.2010))
   ])
 
-  train_dataloader = get_dataloader(config)
-  val_dataloader = get_dataloader(config, train=False)
+  train_dataloader = get_dataloader(config, transforms=transforms)
+  val_dataloader = get_dataloader(config, train=False, transforms=transforms)
 
   model = get_model(config.model, config).to(
     device=config.device,
@@ -219,41 +191,41 @@ def run(config: Config):
     weight_decay=config.train.weight_decay,
   )
 
-  loss_fn = get_loss_func(config).to(config.device, non_blocking=True)
+  loss_fn = get_loss_func(config).cuda()
+
+  if config.early_stopping.enable:
+    early_stopping = EarlyStopping(
+      config.early_stopping.patience,
+      config.early_stopping.verbose,
+    )
 
   # tqdm_ = tqdm(range(config.train.num_epochs), )
   # for epoch in tqdm_:
   steps = 0
   log_steps = set(config.log_steps)
   with tqdm(total=len(log_steps)) as pbar:
+    data: dict[str, float] = {}
+    data_str: dict[str, str] = {}
+    data_str['steps'] = '0'
     while steps < config.train.optimization_steps:
-      data: dict[str, float] = {}
-      data_str: dict[str, str] = {}
-      data_str['steps'] = 0
-
       for images, labels in train_dataloader:
+        model.train()
+        optimizer.zero_grad()
+
         if steps >= config.train.optimization_steps:
           break
 
         images = cast(torch.Tensor, images)
         labels = cast(torch.Tensor, labels)
 
-        images = images.to(config.device, non_blocking=True)
-        labels = labels.to(config.device, non_blocking=True)
+        images = images.cuda()
+        labels = labels.cuda()
 
-        with torch.autocast(
-          config.device,
-          dtype=torch.bfloat16,
-          enabled=config.use_amp,
-        ):
-          y_logit = model(images)
-          loss = loss_fn(y_logit, labels)
+        y_logit = model(images)
+        loss = loss_fn(y_logit, labels)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
 
         if steps in log_steps:
           train_loss, train_acc = test(
@@ -301,50 +273,59 @@ def run(config: Config):
           wandb.log(data, step=steps)
           pbar.update(1)
 
+          if config.early_stopping.enable:
+            if early_stopping(val_loss):
+              return True
+
         data_str['steps'] = str(steps)
         tqdm.set_postfix(pbar, data_str)
         steps += 1
 
+  if config.save_model:
+    state_dict = model.state_dict()
+    torch.save(state_dict, config.output_path)
+
+  return False
+
 def main():
   with hydra.initialize_config_dir(config_dir=str(CONFIG_PATH), version_base='1.1'):
-    yaml_cfg = hydra.compose(config_name=args.config)
+    yaml_config = hydra.compose(config_name=args.config)
 
-    default_cfg = OmegaConf.structured(Config)
+    default_config = OmegaConf.structured(Config)
 
-    cfg = cast(Config, OmegaConf.merge(default_cfg, yaml_cfg))
-    # cfg = cast(Config, hydra.compose(config_name=args.config))
+    config = cast(Config, OmegaConf.merge(default_config, yaml_config))
+    # config = cast(Config, hydra.compose(config_name=args.config))
 
-  cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-  seed_everything(cfg.seed)
+  config.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  # seed_everything(config.seed)
 
-  print(cast(dict[str, Any], OmegaConf.to_object(cfg)))
-  if cfg.debug_mode:
+  if config.debug_mode:
     mode = 'offline'
   else:
     mode = 'online'
   wandb.init(
-    project=cfg.wandb.project,
+    project=config.wandb.project,
     mode=mode,
-    dir=ROOT / cfg.output_dir,
-    config=cast(dict[str, Any], OmegaConf.to_object(cfg))
+    dir=ROOT / config.output_dir,
+    config=cast(dict[str, Any], OmegaConf.to_object(config))
   )
 
-  cfg.input_path = ROOT / cfg.input_dir
-  cfg.output_path = ROOT / cfg.output_dir / wandb.run.dir
+  config.input_path = ROOT / config.input_dir
+  config.output_path = ROOT / config.output_dir / wandb.run.dir
 
-  if not cfg.log_steps:
-    # cfg.log_steps = list(range(100)) + list(range(100, cfg.train.optimization_steps, 10))
-    cfg.log_steps = np.unique(np.clip(
-      np.logspace(0, np.log10(cfg.train.optimization_steps), 2000).astype(int),
+  if not config.log_steps:
+    # config.log_steps = list(range(100)) + list(range(100, config.train.optimization_steps, 10))
+    config.log_steps = np.unique(np.clip(
+      np.logspace(0, np.log10(config.train.optimization_steps), 500).astype(int),
       0,
-      cfg.train.optimization_steps,
+      config.train.optimization_steps,
     )).tolist()
 
   with open(CONFIG_PATH / 'log_config.yaml') as f:
     log_config = yaml.safe_load(f)
 
   logging.config.dictConfig(log_config)
-  file_handler = logging.FileHandler(cfg.output_path / 'out.log')
+  file_handler = logging.FileHandler(config.output_path / 'out.log')
   file_handler.setLevel('INFO')
   file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s:%(lineno)s %(funcName)s [%(levelname)s]: %(message)s"))
 
@@ -352,9 +333,14 @@ def main():
     logger = logging.getLogger(name)
     logger.addHandler(file_handler)
 
-  torch.set_float32_matmul_precision('high')
+  # torch.set_float32_matmul_precision('highest')
   # torch.set_default_dtype(torch.float32)
-  run(cfg)
+  print(cast(dict[str, Any], OmegaConf.to_object(config)))
+
+  early_stopped = run(config)
+  if early_stopped:
+    run_adv(config)
+
 
 if __name__ == '__main__':
   main()

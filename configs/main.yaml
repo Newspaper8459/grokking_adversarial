@@ -2,7 +2,7 @@ debug_mode: false
 seed: 0
 input_dir: input
 output_dir: output
-use_amp: false
+save_model: true
 
 wandb:
   project: grokking_adversarial
@@ -10,7 +10,7 @@ wandb:
 train:
   optimization_steps: 500000
   batch_size: 256
-  optimizer: adam
+  optimizer: adamw
   learning_rate: 0.001
   weight_decay: 0.0
   loss: ce
@@ -30,15 +30,20 @@ local_complexity:
 
 adversarial:
   compute_robust: true
-  atk_eps_numerator: 16
-  atk_alpha_numerator: 2
+  atk_eps: ${fraction:"16/255"}
+  atk_alpha: ${fraction:"4/255"}
   atk_epochs: 10
   dmax: 2.7537
   dmin: -2.4291
 
+early_stopping:
+  enable: true
+  patience: 10
+  verbose: 0
+
 dataset:
   name: cifar-10
-  format: ffcv
+  format: custom
   num_classes: 10
   num_workers: 28
 

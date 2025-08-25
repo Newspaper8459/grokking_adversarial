@@ -11,17 +11,6 @@ import torch.nn.functional as F
 from schema.config import Config
 
 
-@contextmanager
-def temporarily_disable_param_grads(model: nn.Module):
-  states = [p.requires_grad for p in model.parameters()]
-  for p in model.parameters():
-    p.requires_grad_(False)
-  try:
-    yield
-  finally:
-    for p, r in zip(model.parameters(), states):
-        p.requires_grad_(r)
-
 class PGD(object):
   """Untargeted PGD attack. Modified from torchattack.attack to allow non-[0,1] domain data
 
@@ -41,43 +30,37 @@ class PGD(object):
     self.device = config.device
     self.dmax = config.adversarial.dmax
     self.dmin = config.adversarial.dmin
-    self.loss_fn = nn.CrossEntropyLoss()
-    self.scaler = torch.GradScaler()
 
-  def __call__(self, images: torch.Tensor, labels: torch.Tensor):
-    images = images.clone().detach()
-    # labels = labels.clone().detach()
+  def __call__(self, images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    ## TODO: add targeted attacks
 
+    images = images.clone().detach().to(self.device)
+    labels = labels.clone().detach().to(self.device)
+
+    loss = torch.nn.CrossEntropyLoss()
     adv_images = images.clone().detach()
+    dmin = images.min() if self.dmin is None else self.dmin
+    dmax = images.max() if self.dmax is None else self.dmax
 
     if self.random_start:
       # Starting at a uniformly random point
       adv_images = adv_images + torch.rand_like(adv_images)*2*self.eps - self.eps
-      adv_images = torch.clamp(adv_images, min=self.dmin, max=self.dmax)
+      adv_images = torch.clamp(adv_images, min=dmin, max=dmax).detach()
 
     for _ in range(self.steps):
-
       adv_images.requires_grad = True
+      outputs = self.model(adv_images)
 
-      with torch.autocast(self.device, dtype=torch.bfloat16):
-        outputs = self.model(adv_images)
-      loss = self.loss_fn(outputs, labels)
+      cost = loss(outputs, labels)
 
-      # scaled_loss = self.scaler.scale(loss)
       # Update adversarial images
       grad = torch.autograd.grad(
-        loss,
-        adv_images,
-        retain_graph=False,
-        create_graph=False,
-        # only_inputs=True,
+          cost, adv_images, retain_graph=False, create_graph=False
       )[0]
 
-      # grad = scaled_grad / self.scaler.get_scale()
-      # adv_images = adv_images.detach()
-      adv_images = adv_images + self.alpha * grad.sign()
+      adv_images = adv_images.detach() + self.alpha * grad.sign()
       delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
-      adv_images = torch.clamp(images + delta, min=self.dmin, max=self.dmax).detach()
+      adv_images = torch.clamp(images + delta, min=dmin, max=dmax).detach()
 
     return adv_images
 

@@ -6,6 +6,7 @@ from typing import Any, Literal, overload
 import numpy as np
 import numpy.typing as npt
 import torch
+import torch.nn as nn
 import torchvision.transforms as T
 from ffcv.fields import IntField, RGBImageField
 from ffcv.fields.decoders import (
@@ -14,9 +15,13 @@ from ffcv.fields.decoders import (
   SimpleRGBImageDecoder,
 )
 from ffcv.loader import Loader, OrderOption
+from ffcv.pipeline.operation import Operation
 from ffcv.transforms import (
   Convert,
+  Cutout,
   NormalizeImage,
+  RandomHorizontalFlip,
+  RandomTranslate,
   Squeeze,
   ToDevice,
   ToTensor,
@@ -67,7 +72,7 @@ class CustomCIFAR10(CIFAR10):
   ) -> None:
     super().__init__(root, train, transform, target_transform, download)
 
-    self.data_tensor = torch.tensor(self.data, dtype=torch.float32) / 255.0
+    self.data_tensor = torch.tensor(self.data, dtype=torch.float32)
     self.data_tensor = self.data_tensor.permute((0, 3, 1, 2))
     # if self.transform is not None:
       # self.data_tensor = self.transform(self.data)
@@ -78,7 +83,7 @@ class CustomCIFAR10(CIFAR10):
     img, target = self.data_[idx], self.targets[idx]
 
     if self.transform is not None:
-      self.data_tensor = self.transform(self.data)
+      img = self.transform(img)
 
     if self.target_transform is not None:
       target = self.target_transform(target)
@@ -128,11 +133,20 @@ def _get_dataset(
       download=download
     )
   elif dataset_name == 'cifar-10':
-    dataset = CustomCIFAR10(
+    # transforms = T.Compose([
+    #   T.Normalize((0.4914, 0.4822, 0.4465),(0.2023, 0.1994, 0.2010))
+    # ])
+    # dataset = CustomCIFAR10(
+    #   input_path,
+    #   train=train,
+    #   transform=transforms,
+    #   download=download
+    # )
+    dataset = CIFAR10(
       input_path,
       train=train,
       transform=transforms,
-      download=download
+      download=download,
     )
   else:
     raise NotImplementedError
@@ -146,11 +160,11 @@ CIFAR_MEAN = [125.307, 122.961, 113.8575]
 CIFAR_STD = [51.5865, 50.847, 51.255]
 
 MEAN_DICT: dict[str, npt.NDArray[np.float32]] = {
-  'cifar-10': np.array(CIFAR_MEAN),
+  'cifar-10': np.array(CIFAR_MEAN, dtype=np.float32),
 }
 
 STD_DICT: dict[str, npt.NDArray[np.float32]] = {
-  'cifar-10': np.array(CIFAR_STD)
+  'cifar-10': np.array(CIFAR_STD, dtype=np.float32)
 }
 
 def get_dataloader(
@@ -199,32 +213,38 @@ def get_dataloader(
       writer = DatasetWriter(ffcv_path, fields, num_workers=4)
       writer.from_indexed_dataset(dataset)
 
+    image_pipelines: list[nn.Module | Operation] = [
+      SimpleRGBImageDecoder(),
+    ]
+    if train and False:
+      image_pipelines.extend([
+        RandomHorizontalFlip(),
+        RandomTranslate(padding=2, fill=MEAN_DICT[config.dataset.name]),
+        Cutout(4, MEAN_DICT[config.dataset.name]),
+      ])
+
+    image_pipelines.extend([
+      ToTensor(),
+      ToDevice(torch.device(config.device), non_blocking=True),
+      ToTorchImage(),
+      Convert(torch.float32),
+      T.Normalize(
+        MEAN_DICT[config.dataset.name],
+        STD_DICT[config.dataset.name]
+      ),
+    ])
+
     dataloader = Loader(
       str(config.input_path / f'{config.dataset.name}_{mode}.ffcv'),
       batch_size=config.train.batch_size if train else config.val.batch_size,
       num_workers=config.dataset.num_workers,
       os_cache=True,
-      order=OrderOption.QUASI_RANDOM,
+      order=OrderOption.RANDOM,
       seed=config.seed,
       drop_last=train,
-      indices=list(range(config.train.subset_size)) if train else None,
+      # indices=list(range(config.train.subset_size)) if train else None,
       pipelines={
-        'image': [
-          SimpleRGBImageDecoder(),
-          ToTensor(),
-          ToDevice(torch.device(config.device), non_blocking=True),
-          ToTorchImage(),
-          Convert(torch.float32),
-          # NormalizeImage(
-          #   MEAN_DICT[config.dataset.name],
-          #   STD_DICT[config.dataset.name],
-          #   np.float16,
-          # ),
-          T.Normalize(
-            MEAN_DICT[config.dataset.name],
-            STD_DICT[config.dataset.name]
-          ),
-        ],
+        'image': image_pipelines,
         'label': [
           IntDecoder(),
           ToTensor(),
