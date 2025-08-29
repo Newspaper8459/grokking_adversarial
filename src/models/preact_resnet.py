@@ -1,137 +1,201 @@
-from collections.abc import Callable
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.resnet import BasicBlock, ResNet
 
 
-# class PreActBasicBlock(BasicBlock):
-#   def __init__(
-#     self,
-#     inplanes: int,
-#     planes: int,
-#     stride: int = 1,
-#     downsample: nn.Module | None = None,
-#     groups: int = 1,
-#     base_width: int = 64,
-#     dilation: int = 1,
-#     norm_layer: Callable[..., nn.Module] | None = None
-#   ) -> None:
-#     super().__init__(
-#       inplanes,
-#       planes,
-#       stride,
-#       downsample,
-#       groups,
-#       base_width,
-#       dilation,
-#       norm_layer
-#     )
+def conv3x3(
+  in_planes: int,
+  out_planes: int,
+  stride: int = 1,
+  groups: int = 1,
+  dilation: int = 1
+) -> nn.Conv2d:
+  """3x3 convolution with padding"""
+  return nn.Conv2d(
+    in_planes,
+    out_planes,
+    kernel_size=3,
+    stride=stride,
+    padding=dilation,
+    groups=groups,
+    bias=False,
+    dilation=dilation,
+  )
 
-#   def forward(self, x: torch.Tensor) -> torch.Tensor:
-#     identity = x
+class PreActBasicBlock(nn.Module):
+  expansion: int = 1
 
-#     out = self.bn1(x)
-#     out = self.relu(out)
-#     out = self.conv1(out)
+  def __init__(
+    self,
+    inplanes: int,
+    planes: int,
+    stride: int = 1,
+    norm_layer: type[nn.Module] | None = None,
+  ) -> None:
+    super().__init__()
+    if norm_layer is None:
+      norm_layer = nn.BatchNorm2d
 
-#     out = self.bn2(out)
-#     out = self.relu(out)
-#     out = self.conv2(out)
+    self.conv1 = conv3x3(inplanes, planes, stride)
+    self.bn1 = norm_layer(planes)
+    self.relu = nn.ReLU(inplace=True)
+    self.conv2 = conv3x3(planes, planes)
+    self.bn2 = norm_layer(planes)
+    self.stride = stride
 
-#     if self.downsample is not None:
-#       identity = self.downsample(identity)
+    if stride != 1 or inplanes != self.expansion*planes:
+      self.shortcut = nn.Conv2d(
+        inplanes,
+        self.expansion*planes,
+        kernel_size=1,
+        stride=stride,
+        bias=False,
+      )
 
-#     out += identity
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-#     return out
+    out = self.bn1(x)
+    out = self.relu(out)
 
-# def resnet18(
-# #   block: type[PreActBasicBlock],
-# #   layers: list[int],
-#   num_classes: int,
-#   norm_layer: type[nn.Module],
-# ) -> ResNet:
-#   model = ResNet(
-#     PreActBasicBlock,
-#     layers=[2, 2, 2, 2],
-#     num_classes=num_classes,
-#     norm_layer=norm_layer,
-#   )
+    shortcut = out
 
-#   return model
+    out = self.conv1(out)
+    out = self.bn2(out)
+    out = self.relu(out)
+    out = self.conv2(out)
 
-class PreActBlock(nn.Module):
-    '''Pre-activation version of the BasicBlock.'''
-    expansion = 1
+    shortcut = self.shortcut(shortcut) if hasattr(self, 'shortcut') else x
 
-    def __init__(self, in_planes, planes, stride=1, bn=True, **kwargs):
-        super(PreActBlock, self).__init__()
-        if bn:
-            self.bn1 = nn.BatchNorm2d(in_planes)
-        else:
-            self.bn1 = nn.Identity()
-        self.conv1 = nn.Conv2d(
-            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+    out += shortcut
 
-        if bn:
-            self.bn2 = nn.BatchNorm2d(planes)
-        else:
-            self.bn2 = nn.Identity()
-
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
-                               stride=1, padding=1, bias=False)
-
-        if stride != 1 or in_planes != self.expansion*planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes,
-                          kernel_size=1, stride=stride, bias=False)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(x))
-        shortcut = self.shortcut(out) if hasattr(self, 'shortcut') else x
-        out = self.conv1(out)
-        out = self.conv2(F.relu(self.bn2(out)))
-        out += shortcut
-        return out
+    return out
 
 class PreActResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10, init_channels=64, bn=True):
-        super(PreActResNet, self).__init__()
-        self.in_planes = init_channels
-        c = init_channels
+  def __init__(
+    self,
+    block: type[PreActBasicBlock],
+    layers: list[int],
+    num_classes: int = 1000,
+    init_channels: int = 64,
+    norm_layer: type[nn.Module] | None = None,
+    imagenet_stem: bool = True,
+  ) -> None:
+    super().__init__()
+    if norm_layer is None:
+      norm_layer = nn.BatchNorm2d
 
-        self.conv1 = nn.Conv2d(3, c, kernel_size=3,
-                               stride=1, padding=1, bias=False)
-        self.layer1 = self._make_layer(block, c, num_blocks[0], stride=1, bn=bn)
-        self.layer2 = self._make_layer(block, 2*c, num_blocks[1], stride=2, bn=bn)
-        self.layer3 = self._make_layer(block, 4*c, num_blocks[2], stride=2, bn=bn)
-        self.layer4 = self._make_layer(block, 8*c, num_blocks[3], stride=2, bn=bn)
-        self.linear = nn.Linear(8*c*block.expansion, num_classes)
+    self.in_planes = init_channels
+    c = init_channels
 
-    def _make_layer(self, block, planes, num_blocks, stride, bn=True):
-        # eg: [2, 1, 1, ..., 1]. Only the first one downsamples.
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride, bn=bn))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
+    if imagenet_stem:
+      self.conv1 = nn.Conv2d(
+        3,
+        c,
+        kernel_size=7,
+        stride=2,
+        padding=3,
+        bias=False
+      )
+      self.bn1 = norm_layer(c)
+      self.relu = nn.ReLU(inplace=True)
+      self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+    else:
+      self.conv1 = nn.Conv2d(
+        3,
+        c,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=False
+      )
+      self.bn1 = None
+      self.relu = None
+      self.maxpool = None
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
+    self.layer1 = self._make_layer(
+      block=block,
+      planes=c,
+      blocks=layers[0],
+      norm_layer=norm_layer,
+      stride=1
+    )
+    self.layer2 = self._make_layer(
+      block=block,
+      planes=2*c,
+      blocks=layers[1],
+      norm_layer=norm_layer,
+      stride=2
+    )
+    self.layer3 = self._make_layer(
+      block=block,
+      planes=4*c,
+      blocks=layers[2],
+      norm_layer=norm_layer,
+      stride=2
+    )
+    self.layer4 = self._make_layer(
+      block=block,
+      planes=8*c,
+      blocks=layers[3],
+      norm_layer=norm_layer,
+      stride=2
+    )
+    self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+    # self.avgpool = nn.AvgPool2d(4)
+    self.fc = nn.Linear(8 * c * block.expansion, num_classes)
 
-def resnet18(*args, **kwargs) -> PreActResNet:
-  ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-  model = PreActResNet(PreActBlock, [2, 2, 2, 2], num_classes=10, init_channels=16, bn=False)
+  def _make_layer(
+    self,
+    block: type[PreActBasicBlock],
+    planes: int,
+    blocks: int,
+    norm_layer: type[nn.Module],
+    stride: int = 1,
+  ) -> nn.Sequential:
+    strides = [stride] + [1]*(blocks-1)
+    layers: list[PreActBasicBlock] = []
+    for stride in strides:
+      layers.append(
+        block(
+          self.in_planes,
+          planes,
+          stride,
+          norm_layer
+        )
+      )
+      self.in_planes = planes * block.expansion
+    return nn.Sequential(*layers)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    x = self.conv1(x)
+    if self.bn1 is not None:
+      x = self.bn1(x)
+      x = self.relu(x)
+      x = self.maxpool(x)
+
+    x = self.layer1(x)
+    x = self.layer2(x)
+    x = self.layer3(x)
+    x = self.layer4(x)
+    x = self.avgpool(x)
+    x = torch.flatten(x, 1)
+    # x = x.view(x.size(0), -1)
+    x = self.fc(x)
+
+    return x
+
+def resnet18(
+#   layers: list[int],
+  num_classes: int,
+  norm_layer: type[nn.Module],
+) -> PreActResNet:
+  model = PreActResNet(
+    PreActBasicBlock,
+    layers=[2, 2, 2, 2],
+    num_classes=num_classes,
+    norm_layer=norm_layer,
+    init_channels=16,
+    imagenet_stem=False
+  )
+
   return model

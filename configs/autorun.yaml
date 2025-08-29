@@ -1,0 +1,51 @@
+adversarial:
+  atk_alpha: ${fraction:"4/255"}
+  atk_eps: ${fraction:"16/255"}
+  compute_robust: true
+  name: deepfool
+  norm: Linf
+checkpoint_dir: checkpoints/baseline-1m
+dataset:
+  format: ffcv
+  name: cifar-10
+  num_classes: 10
+  num_workers: 28
+debug_mode: false
+input_dir: input
+local_complexity:
+  approx_n: 1024
+  compute_lc: true
+  inc_centroid: false
+  lc_batch_size: 256
+  n_frame: 40
+  r_frame: 0.005
+mlp:
+  hidden_dim: 200
+  hidden_layers: 1
+model:
+  initialization_scale: 1
+  name: preact_resnet18
+output_dir: output
+resnet:
+  bn: identity
+save_model: true
+seed: 0
+train:
+  batch_size: 256
+  grad_norm: 1.0
+  label_smoothing: 0
+  learning_rate: 0.001
+  loss: ce
+  optimization_steps: 1000000
+  optimizer: adamw
+  subset_size: 50000
+  weight_decay: 0.0
+train_adv_samples:
+  enable: false
+  interrupt_step: 3500
+  train_size: 1000
+val:
+  batch_size: 2048
+validate_only: true
+wandb:
+  project: grokking_adversarial

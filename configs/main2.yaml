@@ -2,20 +2,13 @@ debug_mode: false
 seed: 0
 input_dir: input
 output_dir: output
-checkpoint_dir: checkpoints/baseline
-validate_only: true
-
 save_model: true
-
-resume:
-  enable: true
-  step: null
 
 wandb:
   project: grokking_adversarial
 
 train:
-  optimization_steps: 10000000
+  optimization_steps: 500000
   batch_size: 256
   optimizer: adamw
   learning_rate: 0.001
@@ -34,17 +27,14 @@ local_complexity:
   n_frame: 40
   r_frame: 0.005
   lc_batch_size: 256
-  inc_centroid: false
 
 adversarial:
   compute_robust: true
-  name: apgd
   atk_eps: ${fraction:"16/255"}
   atk_alpha: ${fraction:"4/255"}
-  norm: Linf
-  # atk_epochs: 10
-  # dmax: 2.7537
-  # dmin: -2.4291
+  atk_epochs: 10
+  dmax: 2.7537
+  dmin: -2.4291
 
 train_adv_samples:
   enable: false
@@ -57,9 +47,10 @@ dataset:
   num_classes: 10
   num_workers: 28
 
-model:
-  name: preact_resnet18
+mnist:
   initialization_scale: 1
+
+model: preact_resnet18
 
 mlp:
   hidden_dim: 200

@@ -1,0 +1,24 @@
+seed: 0
+input_dir: input
+output_dir: output
+checkpoint_dir: checkpoints/baseline
+loss: ce
+batch_size: 2048
+
+dataset:
+  name: cifar-10
+  format: ffcv
+  num_classes: 10
+  num_workers: 28
+
+mnist:
+  initialization_scale: 1
+
+model: preact_resnet18
+
+mlp:
+  hidden_dim: 200
+  hidden_layers: 1
+
+resnet:
+  bn: identity

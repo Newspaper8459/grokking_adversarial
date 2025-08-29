@@ -6,9 +6,11 @@ import torch
 import torch.nn as nn
 from torch.optim import SGD, Adam, AdamW
 from torch.utils.data import Dataset
+from torchattacks import APGD, CW, FAB, FGSM, PGD, DeepFool
+from torchattacks.attack import Attack
 from torchvision.models.resnet import ResNet
 
-from dataset import CustomCIFAR10, CustomMNIST
+from utils.dataset import CustomCIFAR10, CustomMNIST
 from models.mlp import MLP
 from models.preact_resnet import resnet18
 from schema.config import Config
@@ -89,13 +91,67 @@ def get_model(model_name: str, config: Config) -> nn.Module:
       hidden_layers=config.mlp.hidden_layers,
     )
 
-    with torch.no_grad():
-      for p in model.parameters():
-        p.data *= config.train.initialization_scale
-  elif config.model == 'preact_resnet18':
+  elif model_name == 'preact_resnet18':
     bn = _get_batch_norm_func(config.resnet.bn)
     model = resnet18(config.dataset.num_classes, bn)
   else:
     raise NotImplementedError
 
+  with torch.no_grad():
+    for p in model.parameters():
+      p.data *= config.model.initialization_scale
+
   return model.to(config.device)
+
+@overload
+def get_attack(attack_name: Literal['apgd'], model: nn.Module) -> APGD:
+  ...
+@overload
+def get_attack(attack_name: Literal['cw'], model: nn.Module) -> CW:
+  ...
+@overload
+def get_attack(attack_name: Literal['deepfool'], model: nn.Module) -> DeepFool:
+  ...
+@overload
+def get_attack(attack_name: Literal['fgsm'], model: nn.Module) -> FGSM:
+  ...
+@overload
+def get_attack(attack_name: Literal['pgd'], model: nn.Module) -> PGD:
+  ...
+@overload
+def get_attack(attack_name: str, model: nn.Module) -> Attack:
+  ...
+
+def get_attack(attack_name: str, model: nn.Module) -> Attack:
+  if attack_name == 'apgd':
+    atk = APGD(
+      model,
+      norm='Linf',
+      eps=16/255,
+      steps=20,
+      seed=0
+    )
+  elif attack_name == 'cw':
+    atk = CW(
+      model
+    )
+  elif attack_name == 'deepfool':
+    atk = DeepFool(
+      model
+    )
+  elif attack_name == 'fgsm':
+    atk = FGSM(
+      model,
+      eps=16/255,
+    )
+  elif attack_name == 'pgd':
+    atk = PGD(
+      model,
+      eps=16/255,
+      alpha=4/255,
+      steps=20,
+    )
+  else:
+    raise NotImplementedError
+
+  return atk

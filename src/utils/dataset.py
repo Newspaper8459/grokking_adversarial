@@ -11,7 +11,6 @@ import torchvision.transforms as T
 from ffcv.fields import IntField, RGBImageField
 from ffcv.fields.decoders import (
   IntDecoder,
-  RandomResizedCropRGBImageDecoder,
   SimpleRGBImageDecoder,
 )
 from ffcv.loader import Loader, OrderOption
@@ -19,7 +18,6 @@ from ffcv.pipeline.operation import Operation
 from ffcv.transforms import (
   Convert,
   Cutout,
-  NormalizeImage,
   RandomHorizontalFlip,
   RandomTranslate,
   Squeeze,
@@ -27,7 +25,6 @@ from ffcv.transforms import (
   ToTensor,
   ToTorchImage,
 )
-from ffcv.traversal_order import Random
 from ffcv.writer import DatasetWriter
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.datasets import CIFAR10, MNIST
@@ -170,6 +167,7 @@ STD_DICT: dict[str, npt.NDArray[np.float32]] = {
 def get_dataloader(
   config: Config,
   train: bool = True,
+  subset_size: int | None = None,
   transforms: Callable[[torch.Tensor], torch.Tensor] | None = None,
   download: bool = True,
 ) -> DataLoader[tuple[torch.Tensor, int]] | Loader:
@@ -182,8 +180,8 @@ def get_dataloader(
       download=download,
     )
 
-    if train:
-      dataset = Subset(dataset, range(config.train.subset_size))
+    if subset_size is not None:
+      dataset = Subset(dataset, range(subset_size))
 
     dataloader = DataLoader(
       dataset,
@@ -191,6 +189,7 @@ def get_dataloader(
       shuffle=train,
       num_workers=config.dataset.num_workers,
       generator=g,
+      drop_last=train,
       pin_memory=bool(config.dataset.num_workers),
       persistent_workers=bool(config.dataset.num_workers),
     )
@@ -200,17 +199,20 @@ def get_dataloader(
     if config.dataset.name not in ['cifar-10', 'mnist']:
       raise NotImplementedError
 
-    if not (config.input_path / f'{config.dataset.name}_{mode}.ffcv').exists():
+    if not (config.input_path / f'{config.dataset.name}_{mode}.ffcv').exists() or True:
       dataset = CIFAR10(root=config.input_path, train=train, download=True)
 
-      ffcv_path = config.input_path / f'{config.dataset.name}_{mode}.ffcv'
+      if subset_size is not None:
+        ffcv_path = config.input_path / f'{config.dataset.name}_{mode}_{subset_size}.ffcv'
+      else:
+        ffcv_path = config.input_path / f'{config.dataset.name}_{mode}.ffcv'
 
       fields = {
         'image': RGBImageField(),
         'label': IntField(),
       }
 
-      writer = DatasetWriter(ffcv_path, fields, num_workers=4)
+      writer = DatasetWriter(ffcv_path, fields, num_workers=config.dataset.num_workers)
       writer.from_indexed_dataset(dataset)
 
     image_pipelines: list[nn.Module | Operation] = [
@@ -242,7 +244,7 @@ def get_dataloader(
       order=OrderOption.RANDOM,
       seed=config.seed,
       drop_last=train,
-      # indices=list(range(config.train.subset_size)) if train else None,
+      indices=list(range(subset_size)) if subset_size is not None else None,
       pipelines={
         'image': image_pipelines,
         'label': [

@@ -20,18 +20,18 @@ import yaml
 from ffcv.loader import Loader
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from attacks import PGD
-from dataset import get_dataloader
-from models.preact_resnet import resnet18
 from schema.config import Config
+from utils.attacks import PGD
 from utils.constants import (
   get_loss_func,
   get_model,
   get_optimizer,
 )
+from utils.dataset import get_dataloader
+from workflow import train, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / 'configs'
@@ -66,106 +66,8 @@ def seed_worker(worker_id: int):
   # dataset = worker_info.dataset
   # dataset._init_file()
 
-class EarlyStopping:
-  def __init__(self, patience: int=10, verbose: int=0):
-    self.cnt = 0
-    self.best_loss = float('inf')
-    self.patience = patience
-    self.verbose = verbose
-
-  def __call__(self, loss: float) -> Any:
-    if self.best_loss < loss:
-      self.cnt += 1
-
-      if self.cnt >= self.patience:
-        if self.verbose:
-          print('early stopping')
-        return True
-    else:
-      self.cnt = 0
-      self.best_loss = loss
-
-    return False
-
-def test(
-  config: Config,
-  model: nn.Module,
-  criterion: nn.Module,
-  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
-) -> tuple[float, float]:
-  model.eval()
-
-  total_loss = torch.tensor(0.0, device=config.device)
-  total_correct = torch.tensor(0, device=config.device)
-  total_samples = 0
-
-  for images, labels in dataloader:
-    images = cast(torch.Tensor, images)
-    labels = cast(torch.Tensor, labels)
-
-    images = images.cuda()
-    labels = labels.cuda()
-
-    with torch.no_grad():
-      y_logit = model(images)
-      loss = criterion(y_logit, labels)
-    total_loss += loss
-
-    y_prob = F.softmax(y_logit, dim=1)
-    y_pred = y_prob.argmax(dim=1)
-    correct = (y_pred == labels).sum()
-    total_correct += correct
-    total_samples += labels.shape[0]
-
-  avg_loss = total_loss / len(dataloader)
-  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
-
-  return avg_loss.item(), avg_acc.item()
-
-def validate_adversarial(
-  config: Config,
-  model: nn.Module,
-  criterion: nn.Module,
-  dataloader: DataLoader[tuple[torch.Tensor, int]] | Loader,
-) -> tuple[float, float]:
-  model.eval()
-  atk = PGD(
-    model,
-    config=config,
-  )
-  atk = PGD(
-    model,
-    config,
-  )
-
-  total_loss = torch.tensor(0.0, device=config.device)
-  total_correct = torch.tensor(0, device=config.device)
-  total_samples = 0
-
-  for images, labels in dataloader:
-    images = cast(torch.Tensor, images)
-    labels = cast(torch.Tensor, labels)
-
-    images = images.cuda()
-    labels = labels.cuda()
-
-    adv_images = atk(images, labels)
-
-    with torch.no_grad():
-      y_logit = model(adv_images)
-      loss = criterion(y_logit, labels)
-    total_loss += loss
-
-    y_prob = F.softmax(y_logit, dim=1)
-    y_pred = y_prob.argmax(dim=1)
-    correct = (y_pred == labels).sum()
-    total_correct += correct
-    total_samples += labels.shape[0]
-
-  avg_loss = total_loss / len(dataloader)
-  avg_acc = total_correct / total_samples if total_samples > 0 else torch.tensor(0.0)
-
-  return avg_loss.item(), avg_acc.item()
+g = torch.Generator()
+g.manual_seed(0)
 
 def run(config: Config):
   transforms = T.Compose([
@@ -174,10 +76,18 @@ def run(config: Config):
     T.Normalize((0.4914, 0.4822, 0.4465),(0.2023, 0.1994, 0.2010))
   ])
 
-  train_dataloader = get_dataloader(config, transforms=transforms)
-  val_dataloader = get_dataloader(config, train=False, transforms=transforms)
+  train_dataloader = get_dataloader(
+    config,
+    transforms=transforms,
+    subset_size=config.train.subset_size
+  )
+  val_dataloader = get_dataloader(
+    config,
+    train=False,
+    transforms=transforms
+  )
 
-  model = get_model(config.model, config).to(
+  model = get_model(config.model.name, config).to(
     device=config.device,
     non_blocking=True,
     memory_format=torch.channels_last
@@ -191,101 +101,35 @@ def run(config: Config):
     weight_decay=config.train.weight_decay,
   )
 
-  loss_fn = get_loss_func(config).cuda()
-
-  if config.early_stopping.enable:
-    early_stopping = EarlyStopping(
-      config.early_stopping.patience,
-      config.early_stopping.verbose,
-    )
+  loss_fn = get_loss_func(config).to(config.device, non_blocking=True)
 
   # tqdm_ = tqdm(range(config.train.num_epochs), )
   # for epoch in tqdm_:
-  steps = 0
-  log_steps = set(config.log_steps)
-  with tqdm(total=len(log_steps)) as pbar:
-    data: dict[str, float] = {}
-    data_str: dict[str, str] = {}
-    data_str['steps'] = '0'
-    while steps < config.train.optimization_steps:
-      for images, labels in train_dataloader:
-        model.train()
-        optimizer.zero_grad()
 
-        if steps >= config.train.optimization_steps:
-          break
+  if config.validate_only:
+    assert config.checkpoint_path is not None
+  else:
+    train(
+      config,
+      model,
+      optimizer,
+      loss_fn,
+      train_dataloader
+    )
 
-        images = cast(torch.Tensor, images)
-        labels = cast(torch.Tensor, labels)
+    config.checkpoint_path = config.output_path
 
-        images = images.cuda()
-        labels = labels.cuda()
-
-        y_logit = model(images)
-        loss = loss_fn(y_logit, labels)
-
-        loss.backward()
-        optimizer.step()
-
-        if steps in log_steps:
-          train_loss, train_acc = test(
-            config,
-            model,
-            loss_fn,
-            train_dataloader,
-          )
-          data['train_loss_curve'] = train_loss
-          data['train_acc'] = train_acc
-
-          val_loss, val_acc = test(
-            config,
-            model,
-            loss_fn,
-            val_dataloader
-          )
-          data['val_loss_curve'] = val_loss
-          data['val_acc'] = val_acc
-
-          if config.adversarial.compute_robust:
-            adv_loss, adv_acc = validate_adversarial(
-              config,
-              model,
-              loss_fn,
-              val_dataloader
-            )
-            data['adv_loss_curve'] = adv_loss
-            data['adv_acc'] = adv_acc
-
-          with torch.no_grad():
-            norm = torch.sqrt(
-              sum((p.data.float()**2).sum() for p in model.parameters())
-            ).item()
-            data['norm'] = norm
-
-          data['steps'] = steps
-
-          for k, v in data.items():
-            if k == 'steps':
-              data_str[k] = str(v)
-            else:
-              data_str[k] = f'{v:.4f}'
-
-          wandb.log(data, step=steps)
-          pbar.update(1)
-
-          if config.early_stopping.enable:
-            if early_stopping(val_loss):
-              return True
-
-        data_str['steps'] = str(steps)
-        tqdm.set_postfix(pbar, data_str)
-        steps += 1
+  validate(
+    config,
+    model,
+    loss_fn,
+    train_dataloader,
+    val_dataloader,
+  )
 
   if config.save_model:
     state_dict = model.state_dict()
-    torch.save(state_dict, config.output_path)
-
-  return False
+    torch.save(state_dict, config.output_path / f'{config.train.optimization_steps}.pt')
 
 def main():
   with hydra.initialize_config_dir(config_dir=str(CONFIG_PATH), version_base='1.1'):
@@ -297,7 +141,11 @@ def main():
     # config = cast(Config, hydra.compose(config_name=args.config))
 
   config.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-  # seed_everything(config.seed)
+  seed_everything(config.seed)
+  if config.resume.enable and config.validate_only:
+    raise AttributeError('{config.resume.enable} and {config.validate_only} cannot be True at the same time.')
+  if (config.validate_only or config.resume.enable) and config.checkpoint_dir is None:
+    raise AttributeError('You must specify {config.checkpoint_dir} if {config.resume.enable} or {config.validate_only} is set to True.')
 
   if config.debug_mode:
     mode = 'offline'
@@ -312,11 +160,13 @@ def main():
 
   config.input_path = ROOT / config.input_dir
   config.output_path = ROOT / config.output_dir / wandb.run.dir
+  if config.checkpoint_dir is not None:
+    config.checkpoint_path = ROOT / config.checkpoint_dir
 
   if not config.log_steps:
     # config.log_steps = list(range(100)) + list(range(100, config.train.optimization_steps, 10))
     config.log_steps = np.unique(np.clip(
-      np.logspace(0, np.log10(config.train.optimization_steps), 500).astype(int),
+      np.logspace(0, np.log10(config.train.optimization_steps), 5000).astype(int),
       0,
       config.train.optimization_steps,
     )).tolist()
@@ -337,10 +187,7 @@ def main():
   # torch.set_default_dtype(torch.float32)
   print(cast(dict[str, Any], OmegaConf.to_object(config)))
 
-  early_stopped = run(config)
-  if early_stopped:
-    run_adv(config)
-
+  run(config)
 
 if __name__ == '__main__':
   main()
